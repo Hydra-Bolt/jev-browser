@@ -161,13 +161,17 @@ export class JevBrowser {
   // against the page this caller was last shown, so it reports the same changes the do() loop sees.
   async snapshotText({ diff = false, ...render } = {}) {
     await this.settle();
-    const prev = this.shown;
+    // A diff carries no element numbers, so it must not move this.shown: the caller still acts with
+    // the numbers it last saw. It only advances the base the next diff is taken against.
+    const prev = this.diffBase?.over === this.shown ? this.diffBase.page : this.shown;
     const page = await this.snapshot();
-    this.shown = page;
-    if (!diff) return formatPage(page, render);
     // redact before diffing: state() in pageDiff prints value=, which would leak a typed password
-    const d = pageDiff(redactPage(prev), redactPage(page));
-    if (!d) return `(no previous snapshot to diff against; showing the full page)\n${formatPage(page, render)}`;
+    const d = diff && prev ? pageDiff(redactPage(prev), redactPage(page)) : null;
+    if (!d) {
+      this.shown = page;
+      return `${diff ? "(no previous snapshot to diff against; showing the full page)\n" : ""}${formatPage(page, render)}`;
+    }
+    this.diffBase = { over: this.shown, page };
     return formatDiff(page, d, render);
   }
 

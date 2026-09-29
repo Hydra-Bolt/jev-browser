@@ -200,6 +200,21 @@ test("max_chars truncates, says what was dropped and how to narrow, and is hard-
   assert.ok(formatPage(pg, { maxChars: Infinity, maxElements: 500 }).length > 20000, "library callers can opt out");
 });
 
+test("a diff snapshot keeps the element numbers the caller last saw", async () => {
+  // A diff prints no numbers, so browser_act after it must still resolve numbers from the last
+  // full snapshot, not from the renumbered page the diff was taken of.
+  const b2 = await JevBrowser.launch({ browser });
+  await b2.page.setContent(`<button>Alpha</button><button>Beta</button>`);
+  const full = await b2.snapshotText();
+  const beta = +full.match(/\[(\d+)\] button "Beta"/)[1];
+  await b2.page.evaluate(() => { const x = document.createElement("button"); x.textContent = "Zero"; document.body.prepend(x); });
+  assert.match(await b2.snapshotText({ diff: true }), /added \(1\):\n\s+button "Zero"/);
+  assert.equal(b2.currentElement(beta, await b2.snapshot()).text, "Beta");
+  // and the next diff is against the diffed page, so the same change is not reported twice
+  assert.match(await b2.snapshotText({ diff: true }), /no changes since the previous snapshot/);
+  await b2.close();
+});
+
 test("snapshot diff reports only what changed, and falls back to a full page with no anchor", async () => {
   const b2 = await JevBrowser.launch({ browser });
   await b2.page.setContent(`<button>Alpha</button>`);
