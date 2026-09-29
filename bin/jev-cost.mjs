@@ -345,7 +345,10 @@ export function parseArgs(argv) {
     else if (a === "--question") o.question = next();
     else if (a === "--filter") o.filter = next();
     else if (a === "--case") o.cases = next().split(",").map(s => s.trim()).filter(Boolean);
-    else if (a === "--max-actions") o.maxActions = +next();
+    else if (a === "--max-actions") {
+      o.maxActions = +next();
+      if (!Number.isInteger(o.maxActions) || o.maxActions < 1) throw new Error("--max-actions needs a positive integer");
+    }
     else if (a === "--value") { const [k, ...v] = next().split("="); o.values[k] = v.join("="); }
     else throw new Error(`unknown flag: ${a}  (try --help)`);
   }
