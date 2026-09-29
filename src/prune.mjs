@@ -12,6 +12,7 @@ export const MIN_PRUNE_CHARS = 8000;   // below this, return everything and neve
 export const BUDGET_CHARS = 12_000;    // default character budget for what comes back
 export const BATCH_BLOCKS = 40;        // blocks (= noul questions) per Jev request
 export const BATCH_CHARS = 50_000;     // state chars per request; the API caps at 32,768 tokens
+export const MAX_JEV_CALLS = 10;       // ranking requests per read; blocks past this stay unranked
 export const DROP_BELOW = 0.35;        // bias to keep: drop only when Jev is fairly sure it doesn't help
 
 const SENTENCE = /(?<=[.!?。！？])\s+|\n+/;
@@ -62,14 +63,20 @@ export function normalizeBlocks(raw, { maxBlock = MAX_BLOCK_CHARS } = {}) {
 
 export const totalChars = blocks => blocks.reduce((a, b) => a + b.text.length, 0);
 
+// Request size in English-prose chars: BATCH_CHARS assumes ~4 chars per token, but CJK text runs
+// about one token per char, so each wide char counts as 4 or a CJK batch would blow the token cap.
+const WIDE = /[\u1100-\u11ff\u2e80-\ua4cf\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g;
+export const requestChars = text => text.length + 3 * (text.match(WIDE)?.length ?? 0);
+
 // Group blocks into Jev requests. Asking about many blocks in one request is far cheaper than
 // one request per block, so batches are as large as the token cap and the question count allow.
 export function batchBlocks(blocks, { maxBlocks = BATCH_BLOCKS, maxChars = BATCH_CHARS } = {}) {
   const out = [];
   let cur = [], chars = 0;
   for (const b of blocks) {
-    if (cur.length && (cur.length >= maxBlocks || chars + b.text.length > maxChars)) { out.push(cur); cur = []; chars = 0; }
-    cur.push(b); chars += b.text.length;
+    const n = requestChars(b.text);
+    if (cur.length && (cur.length >= maxBlocks || chars + n > maxChars)) { out.push(cur); cur = []; chars = 0; }
+    cur.push(b); chars += n;
   }
   if (cur.length) out.push(cur);
   return out;
@@ -92,9 +99,11 @@ export function pickBlocks(blocks, scores, { dropBelow = DROP_BELOW, budgetChars
     const p = score(b);
     if (p === undefined || p === null || p >= dropBelow) kept.push(b); else dropped.push({ ...b, why: "not relevant" });
   }
-  // Over budget: give up the least relevant of the keepers first, never a tail truncation.
+  // Over budget: give up the least relevant of the keepers first, never a tail truncation. An
+  // unscored block ranks at the drop line: kept over nothing, but never over a block Jev rated
+  // as helping, or one failed request would push the answer out as "over budget".
   if (totalChars(kept) > budgetChars) {
-    const rank = [...kept].sort((x, y) => (score(y) ?? 1) - (score(x) ?? 1) || x.i - y.i);
+    const rank = [...kept].sort((x, y) => (score(y) ?? dropBelow) - (score(x) ?? dropBelow) || x.i - y.i);
     const room = new Set();
     let used = 0;
     for (const b of rank) {
