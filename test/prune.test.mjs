@@ -4,7 +4,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { JevBrowser } from "../src/session.mjs";
-import { normalizeBlocks, batchBlocks, batchQuestions, pickBlocks, assemble, readResult, formatRead, totalChars, MAX_BLOCK_CHARS } from "../src/prune.mjs";
+import { normalizeBlocks, batchBlocks, batchQuestions, pickBlocks, assemble, readResult, formatRead, totalChars, MAX_BLOCK_CHARS, MAX_JEV_CALLS } from "../src/prune.mjs";
 
 const sentences = (n, word) => Array.from({ length: n }, (_, k) => `${word} sentence ${k} padding padding padding.`).join(" ");
 
@@ -92,6 +92,22 @@ test("picking: over budget, the least relevant keepers go first and the rest sta
   assert.deepEqual(dropped.map(b => b.i), [0, 2]);
   assert.equal(dropped.find(b => b.i === 0).why, "over budget");
   assert.ok(totalChars(kept) <= size * 2 + 1);
+});
+
+test("picking: over budget, an unscored block never outranks one Jev rated relevant", () => {
+  const blocks = four();
+  const size = blocks[0].text.length;
+  // blocks 0-2 come from a failed batch; block 3 is the answer
+  const { kept, dropped } = pickBlocks(blocks, { 3: 0.97 }, { dropBelow: 0.35, budgetChars: size * 2 + 1 });
+  assert.deepEqual(kept.map(b => b.i), [0, 3], "the rated block survives, then unscored ones in document order");
+  assert.ok(dropped.every(b => b.why === "over budget"));
+});
+
+test("batching: CJK text counts as ~1 token per char, so a batch stays under the token cap", () => {
+  const blocks = normalizeBlocks(Array.from({ length: 40 }, (_, k) => ({ text: "漢".repeat(1100), tag: "p", section: `s${k}` })));
+  const batches = batchBlocks(blocks, { maxBlocks: 40, maxChars: 50_000 });
+  assert.ok(batches.length >= 4, `40 x 1100 CJK chars must not go out as one request, got ${batches.length}`);
+  for (const bt of batches) assert.ok(totalChars(bt) <= 12_500);
 });
 
 test("picking: a budget smaller than one block still returns that block rather than nothing", () => {
@@ -240,8 +256,20 @@ test("a failed ranking request keeps its blocks rather than losing them", async 
   assert.equal(r.pruned, true);
   assert.equal(r.dropped_by["not relevant"], undefined, "an unranked block may never be dropped as irrelevant");
   assert.ok(r.dropped_by["over budget"] > 0, "only the character budget may trim it, and that is reported");
-  assert.match(r.reason, /could not be ranked and were kept/);
+  assert.match(r.reason, /could not be ranked and were kept unless over budget/);
   assert.match(b.events.join("\n"), /browser_read: a ranking request failed/);
+  await b.close();
+});
+
+test("ranking requests per read are capped; the rest of the page stays unranked and is reported", async () => {
+  // a heading on every item makes one block per item: 450 blocks is 12 batches of 40
+  const items = Array.from({ length: 450 }, (_, k) => `<h3>Item ${k}</h3><p>Listing entry number ${k} with some text.</p>`).join("");
+  const b = await open(`<!doctype html><title>List</title><body>${items}</body>`);
+  let calls = 0;
+  b.call = async (state, questions) => { calls++; return { answers: Object.fromEntries(Object.keys(questions).map(n => [n, { noul: 0.9 }])), ms: 1, tokens: 1 }; };
+  const r = await b.read("Which items are listed?");
+  assert.equal(calls, MAX_JEV_CALLS);
+  assert.match(r.reason, /only the first \d+ were made/);
   await b.close();
 });
 

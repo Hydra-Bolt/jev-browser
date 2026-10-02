@@ -13,7 +13,7 @@ import { chromium } from "playwright";
 import { jev } from "./jev.mjs";
 import { ENUMERATE, EXTRACT_BLOCKS } from "./page-script.mjs";
 import { FIELDISH, SELECTISH, FILEISH, brief, pageDiff, repeatedElements, formatPage, formatDiff, redactPage } from "./page-model.mjs";
-import { normalizeBlocks, batchBlocks, batchQuestions, pickBlocks, readResult, totalChars, MIN_PRUNE_CHARS, BUDGET_CHARS, DROP_BELOW } from "./prune.mjs";
+import { normalizeBlocks, batchBlocks, batchQuestions, pickBlocks, readResult, totalChars, MIN_PRUNE_CHARS, BUDGET_CHARS, DROP_BELOW, MAX_JEV_CALLS } from "./prune.mjs";
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -143,8 +143,16 @@ export class JevBrowser {
     const frames = [main, ...main.childFrames().filter(f => !f.isDetached())];
     let start = 0; const elements = []; let base; this.frames = new Map();
     for (const [n, f] of frames.entries()) {
-      let r;
-      try { r = await f.evaluate(ENUMERATE, { start, frame: n || undefined }); } catch { continue; }
+      // A frame that never committed a navigation (url "", e.g. a lazy iframe below the fold)
+      // has no execution context, and evaluate() would wait for one forever.
+      if (n > 0 && !f.url()) continue;
+      let r, timer;
+      try {
+        r = await Promise.race([
+          f.evaluate(ENUMERATE, { start, frame: n || undefined }),
+          new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("frame evaluate timed out")), 5000); }),
+        ]);
+      } catch { continue; } finally { clearTimeout(timer); }
       if (n === 0) base = r;
       else if (!r.elements.length) continue;
       for (const e of r.elements) this.frames.set(e.i, f);
@@ -162,13 +170,17 @@ export class JevBrowser {
   // against the page this caller was last shown, so it reports the same changes the do() loop sees.
   async snapshotText({ diff = false, ...render } = {}) {
     await this.settle();
-    const prev = this.shown;
+    // A diff carries no element numbers, so it must not move this.shown: the caller still acts with
+    // the numbers it last saw. It only advances the base the next diff is taken against.
+    const prev = this.diffBase?.over === this.shown ? this.diffBase.page : this.shown;
     const page = await this.snapshot();
-    this.shown = page;
-    if (!diff) return formatPage(page, render);
     // redact before diffing: state() in pageDiff prints value=, which would leak a typed password
-    const d = pageDiff(redactPage(prev), redactPage(page));
-    if (!d) return `(no previous snapshot to diff against; showing the full page)\n${formatPage(page, render)}`;
+    const d = diff && prev ? pageDiff(redactPage(prev), redactPage(page)) : null;
+    if (!d) {
+      this.shown = page;
+      return `${diff ? "(no previous snapshot to diff against; showing the full page)\n" : ""}${formatPage(page, render)}`;
+    }
+    this.diffBase = { over: this.shown, page };
     return formatDiff(page, d, render);
   }
 
@@ -202,8 +214,15 @@ export class JevBrowser {
     const frames = [main, ...main.childFrames().filter(f => !f.isDetached())];
     const blocks = []; let base, truncated = false;
     for (const [n, f] of frames.entries()) {
-      let r;
-      try { r = await f.evaluate(EXTRACT_BLOCKS, { maxBlock, maxChars, frame: n || undefined }); } catch { continue; }
+      // same guards as snapshot(): an uncommitted frame (url "") has no context to evaluate in
+      if (n > 0 && !f.url()) continue;
+      let r, timer;
+      try {
+        r = await Promise.race([
+          f.evaluate(EXTRACT_BLOCKS, { maxBlock, maxChars, frame: n || undefined }),
+          new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("frame evaluate timed out")), 5000); }),
+        ]);
+      } catch { continue; } finally { clearTimeout(timer); }
       if (n === 0) base = r;
       blocks.push(...r.blocks);
       truncated ||= r.truncated;
@@ -233,7 +252,8 @@ export class JevBrowser {
 
     const scores = {};
     let calls = 0, ms = 0;
-    for (const batch of batchBlocks(blocks)) {
+    const batches = batchBlocks(blocks);
+    for (const batch of batches.slice(0, MAX_JEV_CALLS)) {
       const state = { question, page: { url, title, blocks: batch.map(b => ({ i: b.i, ...(b.section ? { section: b.section } : {}), text: b.text })) } };
       try {
         const r = await this.call(state, batchQuestions(batch));
@@ -246,9 +266,10 @@ export class JevBrowser {
     }
     const { kept, dropped } = pickBlocks(blocks, scores, { dropBelow, budgetChars });
     const unranked = blocks.length - Object.keys(scores).length;
+    const capped = batches.length > MAX_JEV_CALLS ? ` (the page needs ${batches.length} ranking requests; only the first ${MAX_JEV_CALLS} were made)` : "";
     return readResult({
       ...base, kept, dropped, pruned: true, jevCalls: calls, jevMs: ms,
-      reason: unranked ? `${unranked} of ${blocks.length} blocks could not be ranked and were kept` : undefined,
+      reason: unranked ? `${unranked} of ${blocks.length} blocks could not be ranked and were kept unless over budget${capped}` : undefined,
     });
   }
 

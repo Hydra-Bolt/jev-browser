@@ -200,6 +200,21 @@ test("max_chars truncates, says what was dropped and how to narrow, and is hard-
   assert.ok(formatPage(pg, { maxChars: Infinity, maxElements: 500 }).length > 20000, "library callers can opt out");
 });
 
+test("a diff snapshot keeps the element numbers the caller last saw", async () => {
+  // A diff prints no numbers, so browser_act after it must still resolve numbers from the last
+  // full snapshot, not from the renumbered page the diff was taken of.
+  const b2 = await JevBrowser.launch({ browser });
+  await b2.page.setContent(`<button>Alpha</button><button>Beta</button>`);
+  const full = await b2.snapshotText();
+  const beta = +full.match(/\[(\d+)\] button "Beta"/)[1];
+  await b2.page.evaluate(() => { const x = document.createElement("button"); x.textContent = "Zero"; document.body.prepend(x); });
+  assert.match(await b2.snapshotText({ diff: true }), /added \(1\):\n\s+button "Zero"/);
+  assert.equal(b2.currentElement(beta, await b2.snapshot()).text, "Beta");
+  // and the next diff is against the diffed page, so the same change is not reported twice
+  assert.match(await b2.snapshotText({ diff: true }), /no changes since the previous snapshot/);
+  await b2.close();
+});
+
 test("snapshot diff reports only what changed, and falls back to a full page with no anchor", async () => {
   const b2 = await JevBrowser.launch({ browser });
   await b2.page.setContent(`<button>Alpha</button>`);
@@ -344,6 +359,33 @@ test("loop guard tells different targets apart on an unchanged page", async () =
   b2.decide = async () => clickAnswers(ids[n++ % ids.length]);
   const r = await b2.do("Click every button", { maxActions: 4 });
   assert.equal(r.status, "max_actions", r.info);
+  await b2.close();
+});
+
+test("an <a> with no href (router-style nav item) is still reachable via the pointer-cursor fallback", async () => {
+  // Real-world shape: a sidebar built with <a class="nav-item"><span>Label</span></a>, no href,
+  // navigation handled by a JS router. Fails the primary `a[href]` selector, so it must be
+  // picked up by the JS-bound-clickable fallback instead of silently disappearing.
+  const b2 = await JevBrowser.launch({ browser });
+  await b2.page.setContent(`<style>.nav-item{cursor:pointer}</style>
+    <aside><a class="nav-item"><span>Ingest</span></a><a class="nav-item"><span>Dashboard</span></a></aside>`);
+  const page2 = await b2.snapshot();
+  assert.ok(page2.elements.some(e => e.text === "Ingest"), "href-less nav anchor must be listed");
+  assert.ok(page2.elements.some(e => e.text === "Dashboard"), "href-less nav anchor must be listed");
+  await b2.close();
+});
+
+test("snapshot does not hang on an iframe that never committed a navigation", async () => {
+  // A lazy iframe below the fold never loads: Playwright lists it with url "" and
+  // frame.evaluate() on it waits forever for an execution context (issue #5).
+  const b2 = await JevBrowser.launch({ browser });
+  await b2.page.setContent(`<button>Top</button><div style="height:5000px"></div>
+    <iframe loading="lazy" src="https://example.invalid/"></iframe>`);
+  assert.ok(b2.page.mainFrame().childFrames().some(f => !f.url()), "fixture should have an uncommitted frame");
+  const t0 = Date.now();
+  const page2 = await b2.snapshot();
+  assert.ok(Date.now() - t0 < 2000, "snapshot should skip the frame, not wait on it");
+  assert.ok(page2.elements.some(e => e.text === "Top"));
   await b2.close();
 });
 

@@ -32,9 +32,13 @@ export const ENUMERATE = ({ start, frame }) => {
     const tag = el.tagName.toLowerCase();
     let pick = el.matches(SEL);
     if (!pick && !["html", "body", "label", "svg", "path"].includes(tag) && el.parentElement) {
-      // JS-bound clickables (div/span/th with a click handler) usually show a pointer cursor
+      // JS-bound clickables (div/span/th with a click handler) usually show a pointer cursor.
+      // The "not nested in a real link/button" guard below must start from the PARENT, not el
+      // itself: el only reaches this branch because it already failed SEL, so when el itself
+      // is an <a> without href or a role-less custom button (router links, styled tabs), a
+      // self-inclusive closest() disqualifies the exact element this fallback exists to catch.
       const cur = getComputedStyle(el).cursor;
-      pick = cur === "pointer" && getComputedStyle(el.parentElement).cursor !== "pointer" && !el.closest("a, button, [role=button]");
+      pick = cur === "pointer" && getComputedStyle(el.parentElement).cursor !== "pointer" && !el.parentElement.closest("a, button, [role=button]");
     }
     // table headers (often sortable) and sizeable images (hover targets, image links' content)
     if (!pick && (tag === "th" && el.closest("thead") || tag === "img" && !el.closest("a, button"))) {
