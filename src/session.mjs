@@ -12,7 +12,7 @@
 import { chromium } from "playwright";
 import { jev } from "./jev.mjs";
 import { ENUMERATE, EXTRACT_BLOCKS } from "./page-script.mjs";
-import { FIELDISH, SELECTISH, FILEISH, brief, pageDiff, repeatedElements, formatPage } from "./page-model.mjs";
+import { FIELDISH, SELECTISH, FILEISH, brief, pageDiff, repeatedElements, formatPage, formatDiff, redactPage } from "./page-model.mjs";
 import { normalizeBlocks, batchBlocks, batchQuestions, pickBlocks, readResult, totalChars, MIN_PRUNE_CHARS, BUDGET_CHARS, DROP_BELOW, MAX_JEV_CALLS } from "./prune.mjs";
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -143,8 +143,16 @@ export class JevBrowser {
     const frames = [main, ...main.childFrames().filter(f => !f.isDetached())];
     let start = 0; const elements = []; let base; this.frames = new Map();
     for (const [n, f] of frames.entries()) {
-      let r;
-      try { r = await f.evaluate(ENUMERATE, { start, frame: n || undefined }); } catch { continue; }
+      // A frame that never committed a navigation (url "", e.g. a lazy iframe below the fold)
+      // has no execution context, and evaluate() would wait for one forever.
+      if (n > 0 && !f.url()) continue;
+      let r, timer;
+      try {
+        r = await Promise.race([
+          f.evaluate(ENUMERATE, { start, frame: n || undefined }),
+          new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("frame evaluate timed out")), 5000); }),
+        ]);
+      } catch { continue; } finally { clearTimeout(timer); }
       if (n === 0) base = r;
       else if (!r.elements.length) continue;
       for (const e of r.elements) this.frames.set(e.i, f);
@@ -157,7 +165,24 @@ export class JevBrowser {
     return s;
   }
 
-  async snapshotText() { await this.settle(); this.shown = await this.snapshot(); return formatPage(this.shown); }
+  // The snapshot the caller reads itself — the one observation it pays for in full. Every option
+  // narrows the rendering only; none of them collects less or calls Jev. `diff` reuses pageDiff()
+  // against the page this caller was last shown, so it reports the same changes the do() loop sees.
+  async snapshotText({ diff = false, ...render } = {}) {
+    await this.settle();
+    // A diff carries no element numbers, so it must not move this.shown: the caller still acts with
+    // the numbers it last saw. It only advances the base the next diff is taken against.
+    const prev = this.diffBase?.over === this.shown ? this.diffBase.page : this.shown;
+    const page = await this.snapshot();
+    // redact before diffing: state() in pageDiff prints value=, which would leak a typed password
+    const d = diff && prev ? pageDiff(redactPage(prev), redactPage(page)) : null;
+    if (!d) {
+      this.shown = page;
+      return `${diff ? "(no previous snapshot to diff against; showing the full page)\n" : ""}${formatPage(page, render)}`;
+    }
+    this.diffBase = { over: this.shown, page };
+    return formatDiff(page, d, render);
+  }
 
   async call(state, questions) {
     const r = await jev(state, questions);
