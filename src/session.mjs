@@ -142,8 +142,16 @@ export class JevBrowser {
     const frames = [main, ...main.childFrames().filter(f => !f.isDetached())];
     let start = 0; const elements = []; let base; this.frames = new Map();
     for (const [n, f] of frames.entries()) {
-      let r;
-      try { r = await f.evaluate(ENUMERATE, { start, frame: n || undefined }); } catch { continue; }
+      // A frame that never committed a navigation (url "", e.g. a lazy iframe below the fold)
+      // has no execution context, and evaluate() would wait for one forever.
+      if (n > 0 && !f.url()) continue;
+      let r, timer;
+      try {
+        r = await Promise.race([
+          f.evaluate(ENUMERATE, { start, frame: n || undefined }),
+          new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("frame evaluate timed out")), 5000); }),
+        ]);
+      } catch { continue; } finally { clearTimeout(timer); }
       if (n === 0) base = r;
       else if (!r.elements.length) continue;
       for (const e of r.elements) this.frames.set(e.i, f);

@@ -271,6 +271,20 @@ test("an <a> with no href (router-style nav item) is still reachable via the poi
   await b2.close();
 });
 
+test("snapshot does not hang on an iframe that never committed a navigation", async () => {
+  // A lazy iframe below the fold never loads: Playwright lists it with url "" and
+  // frame.evaluate() on it waits forever for an execution context (issue #5).
+  const b2 = await JevBrowser.launch({ browser });
+  await b2.page.setContent(`<button>Top</button><div style="height:5000px"></div>
+    <iframe loading="lazy" src="https://example.invalid/"></iframe>`);
+  assert.ok(b2.page.mainFrame().childFrames().some(f => !f.url()), "fixture should have an uncommitted frame");
+  const t0 = Date.now();
+  const page2 = await b2.snapshot();
+  assert.ok(Date.now() - t0 < 2000, "snapshot should skip the frame, not wait on it");
+  assert.ok(page2.elements.some(e => e.text === "Top"));
+  await b2.close();
+});
+
 test("act: element numbers are matched to the current page, and stale ones are refused", async () => {
   const b2 = await JevBrowser.launch({ browser });
   await b2.page.setContent(`<button onclick="document.body.dataset.hit = 'save'">Save</button><button id="rm">Remove me</button>`);
