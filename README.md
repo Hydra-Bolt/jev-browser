@@ -58,11 +58,11 @@ Known limits, so write steps around them:
 
 ```bash
 npx playwright install chromium          # once
-claude mcp add jev-browser -e TYPESAFE_API_KEY=your-key -- npx -y -p jev-browser jev-browser-mcp
+claude mcp add jev-browser -e OPENROUTER_API_KEY=your-key -- npx -y -p jev-browser jev-browser-mcp
 ```
 
 Any MCP client works the same way: command `npx`, args `-y -p jev-browser jev-browser-mcp`,
-env `TYPESAFE_API_KEY`. Add `JEV_BROWSER_HEADED=1` to watch it work.
+env `OPENROUTER_API_KEY` (or `TYPESAFE_API_KEY` for the original Jev backend). Add `JEV_BROWSER_HEADED=1` to watch it work.
 
 ## Setup (from source)
 
@@ -70,7 +70,7 @@ env `TYPESAFE_API_KEY`. Add `JEV_BROWSER_HEADED=1` to watch it work.
 git clone https://github.com/Ying-Kai-Liao/jev-browser && cd jev-browser
 npm install
 npm run setup                    # downloads Chromium for Playwright
-cp .env.example .env             # add TYPESAFE_API_KEY
+cp .env.example .env             # add OPENROUTER_API_KEY
 npm test                         # offline tests (no network, no key)
 npm run test:e2e                 # MCP server end to end (network + key)
 ```
@@ -81,7 +81,7 @@ npm run test:e2e                 # MCP server end to end (network + key)
 claude mcp add jev-browser -- node /absolute/path/to/jev-browser/bin/jev-browser-mcp.mjs
 ```
 
-From a source checkout the server reads `TYPESAFE_API_KEY` from the repo's `.env`.
+From a source checkout the server reads `OPENROUTER_API_KEY` (or `TYPESAFE_API_KEY`) from the repo's `.env`.
 
 | tool | purpose |
 |---|---|
@@ -278,3 +278,12 @@ Publishing uses npm trusted publishing, set up once with
 ## License
 
 MIT
+
+## Model backend: OpenRouter or Typesafe
+
+If `OPENROUTER_API_KEY` is set (environment, `.env`, or the parent repo's `.env`), every Jev question
+is answered by a chat model through OpenRouter, prompted to return probabilities in the same
+`noul` / `choice` / `score` shapes. Otherwise `TYPESAFE_API_KEY` uses the original Jev API.
+`JEV_PROVIDER=openrouter|typesafe` forces one; `JEV_OPENROUTER_MODEL` (default
+`google/gemini-2.5-flash`) picks the model. A general chat model is slower than Jev's ~300 ms
+(about 1.5-3 s per call here), and the accuracy figures above were measured with Jev, not it.

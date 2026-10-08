@@ -1,5 +1,8 @@
-// Minimal client for the Typesafe System One API (model: Jev).
-// Jev answers typed questions over a state object; it never generates text.
+// Client for answering typed questions over a state object. Two backends, same return shape:
+//  - OpenRouter (default when OPENROUTER_API_KEY is set): a chat model is prompted to return
+//    probabilities, emulating Jev's noul/choice/score answers.
+//  - Typesafe System One (model: Jev), used when only TYPESAFE_API_KEY is set.
+// Force one with JEV_PROVIDER=openrouter|typesafe. Answers are probabilities, never free text.
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,42 +12,129 @@ export const API_URL = process.env.JEV_API_URL || "https://api.typesafe.ai/v1/sy
 export const MODEL = process.env.JEV_MODEL || "jev-latest";
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-const KEY_NAMES = ["TYPESAFE_API_KEY"];
-let cachedKey;
-export function apiKey() {
-  if (cachedKey) return cachedKey;
-  for (const k of KEY_NAMES) if (process.env[k]) return (cachedKey = process.env[k]);
-  for (const p of [resolve(process.cwd(), ".env"), resolve(ROOT, ".env")]) {
+const OPENROUTER_URL = process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1/chat/completions";
+export const OPENROUTER_MODEL = process.env.JEV_OPENROUTER_MODEL || "google/gemini-2.5-flash";
+
+const keyCache = {};
+function readKey(name) {
+  if (keyCache[name]) return keyCache[name];
+  if (process.env[name]) return (keyCache[name] = process.env[name]);
+  // cwd, this package, then the parent repo (jev-browser lives inside TIEAGENT, whose .env holds OPENROUTER_API_KEY)
+  for (const p of [resolve(process.cwd(), ".env"), resolve(ROOT, ".env"), resolve(ROOT, "..", ".env")]) {
     if (!existsSync(p)) continue;
     for (const line of readFileSync(p, "utf8").split("\n")) {
       const m = line.match(/^\s*(?:export\s+)?([A-Z_]+)\s*=\s*"?([^"\s]+)"?/);
-      if (m && KEY_NAMES.includes(m[1])) return (cachedKey = m[2]);
+      if (m && m[1] === name) return (keyCache[name] = m[2]);
     }
   }
-  throw new Error("No TypeSafe API key: set TYPESAFE_API_KEY in the environment or in .env");
+  return undefined;
+}
+
+export function provider() {
+  const forced = process.env.JEV_PROVIDER;
+  if (forced === "openrouter" || forced === "typesafe") return forced;
+  if (readKey("OPENROUTER_API_KEY")) return "openrouter";
+  return "typesafe";
+}
+
+export function apiKey() {
+  const name = provider() === "openrouter" ? "OPENROUTER_API_KEY" : "TYPESAFE_API_KEY";
+  const k = readKey(name);
+  if (!k) throw new Error(`No API key: set ${name} in the environment or in .env`);
+  return k;
+}
+
+const SYSTEM = `You answer typed questions about a JSON \`state\` object. You never write free text. Reply with ONE JSON object whose keys are the question names.
+- type "noul": a yes/no question. Value: {"p": <probability the answer is yes, 0..1>}.
+- type "score": a rating question. Value: {"p": <rating normalised to 0..1>}.
+- type "choice": pick one option. The options are the keys of the question's "criteria" (a value, when not null, describes the option). Value: {"top": {"<option key>": <probability>, ...}} with the up to 5 most likely option keys, using keys exactly as given; probabilities should sum to about 1.
+Be calibrated: use values near 0 or 1 only when the state makes the answer clear, and spread probability when it is ambiguous. Output JSON only.`;
+
+const clamp01 = n => (Number.isFinite(+n) ? Math.min(1, Math.max(0, +n)) : NaN);
+
+// Turn the model's raw JSON into the System One answer shape.
+export function shapeAnswers(raw, questions) {
+  const answers = {};
+  for (const [name, q] of Object.entries(questions)) {
+    const a = raw?.[name];
+    if (a == null) throw new Error(`model omitted answer "${name}"`);
+    if (q.type === "choice") {
+      const keys = Object.keys(q.criteria ?? {});
+      const probabilities = Object.fromEntries(keys.map(k => [k, 0]));
+      let sum = 0;
+      for (const [k, v] of Object.entries(a.top ?? a.probabilities ?? {})) {
+        const p = clamp01(v);
+        if (k in probabilities && p === p) { probabilities[k] = p; sum += p; }
+      }
+      if (!sum) throw new Error(`model gave no valid option for "${name}"`);
+      for (const k of keys) probabilities[k] /= sum;
+      const choice = keys.reduce((b, k) => (probabilities[k] > probabilities[b] ? k : b), keys[0]);
+      answers[name] = { choice, probabilities, confidence: probabilities[choice] };
+    } else {
+      const p = clamp01(a.p ?? a[q.type] ?? a);
+      if (p !== p) throw new Error(`model gave a non-numeric answer for "${name}"`);
+      answers[name] = q.type === "score" ? { score: p } : { noul: p };
+    }
+  }
+  return answers;
+}
+
+function parseJson(text) {
+  const t = String(text ?? "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  try { return JSON.parse(t); } catch { /* fall through: take the outermost braces */ }
+  const i = t.indexOf("{"), j = t.lastIndexOf("}");
+  if (i >= 0 && j > i) return JSON.parse(t.slice(i, j + 1));
+  throw new Error("model reply was not JSON");
+}
+
+async function callOpenRouter(key, state, questions, timeout) {
+  const res = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", "X-Title": "jev-browser" },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: SYSTEM },
+        { role: "user", content: JSON.stringify({ state, questions }) },
+      ],
+    }),
+    signal: AbortSignal.timeout(timeout),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) return { res, body };
+  const content = body.choices?.[0]?.message?.content;
+  return { res, body, answers: shapeAnswers(parseJson(content), questions), tokens: body.usage?.prompt_tokens ?? 0 };
 }
 
 // questions: { name: { type: "noul" | "choice" | "score", instructions, criteria? } }
 export async function jev(state, questions, { retries = 2, timeout = 60_000 } = {}) {
   const key = apiKey();
+  const viaOpenRouter = provider() === "openrouter";
   for (let attempt = 0; ; attempt++) {
     const t = performance.now();
-    let res, body;
+    let res, body, answers, tokens;
     try {
-      res = await fetch(API_URL, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ state, model: MODEL, questions }),
-        signal: AbortSignal.timeout(timeout),
-      });
-      body = await res.json().catch(() => ({}));
+      if (viaOpenRouter) {
+        ({ res, body, answers, tokens } = await callOpenRouter(key, state, questions, timeout));
+      } else {
+        res = await fetch(API_URL, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ state, model: MODEL, questions }),
+          signal: AbortSignal.timeout(timeout),
+        });
+        body = await res.json().catch(() => ({}));
+        answers = body.answers; tokens = body.usage?.input_tokens ?? 0;
+      }
     } catch (e) {
       if (attempt < retries) { await sleep(800 * (attempt + 1)); continue; }
       throw e;
     }
     const ms = Math.round(performance.now() - t);
-    if (res.ok) return { answers: body.answers, ms, tokens: body.usage?.input_tokens ?? 0 };
+    if (res.ok) return { answers, ms, tokens };
     if (attempt < retries && (res.status === 429 || res.status >= 500)) { await sleep(800 * (attempt + 1)); continue; }
-    throw new Error(`Jev ${res.status}: ${JSON.stringify(body).slice(0, 300)}`);
+    throw new Error(`${viaOpenRouter ? "OpenRouter" : "Jev"} ${res.status}: ${JSON.stringify(body).slice(0, 300)}`);
   }
 }

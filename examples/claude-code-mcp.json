@@ -3,7 +3,7 @@
     "jev-browser": {
       "command": "npx",
       "args": ["-y", "-p", "jev-browser", "jev-browser-mcp"],
-      "env": { "TYPESAFE_API_KEY": "your-typesafe-api-key", "JEV_BROWSER_HEADED": "0" }
+      "env": { "OPENROUTER_API_KEY": "your-openrouter-api-key", "JEV_BROWSER_HEADED": "0" }
     }
   }
 }
